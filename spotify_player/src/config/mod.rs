@@ -15,7 +15,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{LazyLock, OnceLock},
 };
 
 use anyhow::Context;
@@ -27,6 +27,11 @@ pub use theme::Theme;
 use crate::auth::{NCSPOT_CLIENT_ID, SPOTIFY_CLIENT_ID};
 
 static CONFIGS: OnceLock<Configs> = OnceLock::new();
+
+/// Connect device ID of the integrated player, fixed for the process lifetime so that
+/// reconnecting a session re-registers the same device instead of leaving a stale one behind.
+static INTEGRATED_DEVICE_ID: LazyLock<String> =
+    LazyLock::new(|| SessionConfig::default().device_id);
 
 #[derive(Debug)]
 pub struct Configs {
@@ -499,6 +504,7 @@ impl AppConfig {
             proxy,
             ap_port: self.ap_port,
             client_id: SPOTIFY_CLIENT_ID.to_string(),
+            device_id: INTEGRATED_DEVICE_ID.clone(),
             autoplay: Some(self.device.autoplay),
             ..Default::default()
         }

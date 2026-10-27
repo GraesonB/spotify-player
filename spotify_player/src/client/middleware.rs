@@ -12,6 +12,28 @@ use tokio::{
 };
 
 const GET_DEDUPLICATION_WINDOW: Duration = Duration::from_secs(1);
+/// Upper bound for a single Spotify Web API request. Without it, a connection stalled by a
+/// network change or system sleep never resolves, and deduplicated GETs would all wait on it.
+#[cfg(not(test))]
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(test)]
+const REQUEST_TIMEOUT: Duration = Duration::from_millis(200);
+
+async fn run_with_timeout(
+    next: Next<'_>,
+    request: Request,
+    extensions: &mut Extensions,
+) -> reqwest_middleware::Result<Response> {
+    let url = request.url().clone();
+    tokio::time::timeout(REQUEST_TIMEOUT, next.run(request, extensions))
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::Middleware(anyhow::anyhow!(
+                "Spotify Web API request to {url} timed out after {}s",
+                REQUEST_TIMEOUT.as_secs()
+            )))
+        })
+}
 
 #[derive(Clone, Debug)]
 struct CachedResponse {
@@ -338,7 +360,7 @@ impl SpotifyApiMiddleware {
                 )));
             };
 
-            let response = next.clone().run(request, extensions).await?;
+            let response = run_with_timeout(next.clone(), request, extensions).await?;
             self.observe_rate_limit(&response, &Method::GET, url).await;
 
             let retry_after = Self::retry_after(response.headers());
@@ -351,6 +373,22 @@ impl SpotifyApiMiddleware {
         }
 
         unreachable!("GET retry loop always returns a response or error")
+    }
+}
+
+/// Applies [`REQUEST_TIMEOUT`] to every request, for clients without [`SpotifyApiMiddleware`].
+#[derive(Clone, Debug)]
+pub(super) struct TimeoutMiddleware;
+
+#[async_trait::async_trait]
+impl Middleware for TimeoutMiddleware {
+    async fn handle(
+        &self,
+        request: Request,
+        extensions: &mut Extensions,
+        next: Next<'_>,
+    ) -> reqwest_middleware::Result<Response> {
+        run_with_timeout(next, request, extensions).await
     }
 }
 
@@ -375,7 +413,7 @@ impl Middleware for SpotifyApiMiddleware {
 
         tracing::info!(%method, %url, "Making a Spotify Web API request");
 
-        let response = next.run(request, extensions).await;
+        let response = run_with_timeout(next, request, extensions).await;
         if let Ok(response) = &response {
             self.observe_rate_limit(response, &method, &url).await;
         }
@@ -385,7 +423,10 @@ impl Middleware for SpotifyApiMiddleware {
 
 #[cfg(test)]
 mod tests {
-    use super::{GetRegistration, SharedGetResult, SpotifyApiMiddleware, SpotifyApiRequestManager};
+    use super::{
+        GetRegistration, SharedGetResult, SpotifyApiMiddleware, SpotifyApiRequestManager,
+        TimeoutMiddleware,
+    };
     use reqwest::{header::HeaderValue, StatusCode, Url};
     use reqwest_middleware::ClientBuilder;
     use std::{
@@ -605,5 +646,31 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn times_out_hung_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/me/player"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+
+        for client in [
+            ClientBuilder::new(reqwest::Client::new())
+                .with(TimeoutMiddleware)
+                .build(),
+            ClientBuilder::new(reqwest::Client::new())
+                .with(SpotifyApiMiddleware::new(&format!("{}/v1", server.uri()), 2).unwrap())
+                .build(),
+        ] {
+            let err = client
+                .get(format!("{}/v1/me/player", server.uri()))
+                .send()
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("timed out"), "{err}");
+        }
     }
 }

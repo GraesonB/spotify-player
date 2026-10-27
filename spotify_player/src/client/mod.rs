@@ -7,10 +7,11 @@ use crate::{auth, config};
 use crate::{
     auth::AuthConfig,
     state::{
-        store_data_into_file_cache, Album, AlbumId, Artist, ArtistId, Category, Context, ContextId,
-        Device, FileCacheKey, Item, ItemId, MemoryCaches, Playback, PlaybackMetadata, Playlist,
-        PlaylistFolderItem, PlaylistId, SearchResults, SharedState, Show, ShowId, Track, TrackId,
-        UserId, TTL_CACHE_DURATION, USER_LIKED_TRACKS_URI, USER_RECENTLY_PLAYED_TRACKS_URI,
+        load_playlist_from_file_cache, store_data_into_file_cache, store_playlist_into_file_cache,
+        Album, AlbumId, Artist, ArtistId, CachedPlaylist, Category, Context, ContextId, Device,
+        FileCacheKey, Item, ItemId, Playback, PlaybackMetadata, Playlist, PlaylistFolderItem,
+        PlaylistId, SearchResults, SharedState, Show, ShowId, Track, TrackId, UserId,
+        TTL_CACHE_DURATION, USER_LIKED_TRACKS_URI, USER_RECENTLY_PLAYED_TRACKS_URI,
         USER_TOP_TRACKS_URI,
     },
 };
@@ -24,6 +25,7 @@ use librespot_core::SpotifyUri;
 #[cfg(feature = "streaming")]
 use parking_lot::Mutex;
 
+use futures::StreamExt as _;
 use rspotify::model::LibraryId;
 use rspotify::{http::Query, prelude::*};
 
@@ -33,7 +35,7 @@ mod request;
 mod spotify;
 
 pub use handlers::*;
-use middleware::SpotifyApiMiddleware;
+use middleware::{SpotifyApiMiddleware, TimeoutMiddleware};
 pub use request::*;
 use serde::Deserialize;
 pub(crate) use spotify::{PkceWebApiClient, WebApiClient};
@@ -78,6 +80,21 @@ pub struct AppClient {
     api_client: WebApiClient,
     #[cfg(feature = "streaming")]
     stream_conn: Arc<Mutex<Option<librespot_connect::Spirc>>>,
+    /// URIs of contexts currently being fetched, so repeated `GetContext` requests for a
+    /// slow (e.g. rate-limited) context don't start duplicate fetches.
+    loading_contexts: Arc<parking_lot::Mutex<HashSet<String>>>,
+}
+
+/// Removes a context URI from [`AppClient::loading_contexts`] when the fetch ends.
+struct LoadingContextGuard {
+    loading_contexts: Arc<parking_lot::Mutex<HashSet<String>>>,
+    uri: String,
+}
+
+impl Drop for LoadingContextGuard {
+    fn drop(&mut self) {
+        self.loading_contexts.lock().remove(&self.uri);
+    }
 }
 
 impl Deref for AppClient {
@@ -139,7 +156,8 @@ pub fn new_api_client() -> Result<WebApiClient> {
         rspotify::Credentials { id, secret: None },
         build_oauth(configs.app_config.login_redirect_uri.clone()),
         build_config(&primary_cache_file),
-    );
+    )
+    .with_middleware(TimeoutMiddleware);
 
     let fallback_cache_file = format!("{}_token.json", auth::NCSPOT_CLIENT_ID);
     let fallback_config = build_config(&fallback_cache_file);
@@ -180,6 +198,7 @@ impl AppClient {
 
             #[cfg(feature = "streaming")]
             stream_conn: Arc::new(Mutex::new(None)),
+            loading_contexts: Arc::default(),
         })
     }
 
@@ -298,9 +317,9 @@ impl AppClient {
             tracing::warn!("Failed to refresh auth token after creating a new session: {err:#}");
         }
 
+        // Caches are kept: their contents don't depend on the session, and reconnects happen
+        // often enough (e.g. after network drops) that refetching everything hits rate limits.
         if let Some(state) = state {
-            // reset the application's caches
-            state.data.write().caches = MemoryCaches::new();
             self.initialize_playback(state, was_playing);
         }
 
@@ -332,7 +351,7 @@ impl AppClient {
         // shutdown old streaming connection and replace it with a new connection
         if let Some(conn) = stream_conn.as_ref() {
             if let Err(err) = conn.shutdown() {
-                log::error!("Failed to shutdown old streaming connection: {err:#}");
+                tracing::error!("Failed to shutdown old streaming connection: {err:#}");
             }
         }
         *stream_conn = Some(new_conn);
@@ -370,7 +389,11 @@ impl AppClient {
                 // because `TransferPlayback` doesn't require an active playback
                 self.transfer_playback(&device_id, Some(force_play)).await?;
                 tracing::info!("Transferred playback to device with id={}", device_id);
-                return Ok(None);
+                return Ok(playback.map(|mut p| {
+                    p.device_id = Some(device_id);
+                    p.is_playing = force_play;
+                    p
+                }));
             }
             PlayerRequest::StartPlayback(p, shuffle) => {
                 // Set the playback's shuffle state if specified in the request
@@ -509,9 +532,34 @@ impl AppClient {
                 state.data.write().user_data.user = Some(user);
             }
             ClientRequest::Player(request) => {
+                // Without a refresh, a missing playback would make every command fail until
+                // something else happens to update the state (periodic refresh is off by default).
+                if state.player.read().buffered_playback.is_none() {
+                    self.retrieve_current_playback(state, true).await?;
+                }
+
+                let transfer_target = match &request {
+                    PlayerRequest::TransferPlayback(device_id, _) => Some(device_id.clone()),
+                    _ => None,
+                };
+
                 let playback = state.player.read().buffered_playback.clone();
-                let playback = self.handle_player_request(request, playback).await?;
+                let playback = match self.handle_player_request(request.clone(), playback).await {
+                    Err(err) if is_device_not_found(&err) => {
+                        tracing::warn!(
+                            "Player request targeted a stale device, refreshing playback and retrying: {err:#}"
+                        );
+                        self.retrieve_current_playback(state, true).await?;
+                        let playback = state.player.read().buffered_playback.clone();
+                        self.handle_player_request(request, playback).await?
+                    }
+                    result => result?,
+                };
                 state.player.write().buffered_playback = playback;
+
+                if let Some(device_id) = transfer_target {
+                    self.wait_for_active_device(state, &device_id).await?;
+                }
                 self.update_playback_non_blocking(state);
             }
             ClientRequest::GetCurrentPlayback => {
@@ -588,10 +636,20 @@ impl AppClient {
                 let cache_miss = uri != USER_LIKED_TRACKS_URI
                     && !state.data.read().caches.context.contains_key(&uri);
                 let is_liked = uri == USER_LIKED_TRACKS_URI;
+                if !self.loading_contexts.lock().insert(uri.clone()) {
+                    tracing::info!("Context {uri} is already being fetched, skipping");
+                    return Ok(());
+                }
+                let _guard = LoadingContextGuard {
+                    loading_contexts: Arc::clone(&self.loading_contexts),
+                    uri: uri.clone(),
+                };
+
                 if cache_miss || is_liked {
                     let ctx = match context {
                         ContextId::Playlist(playlist_id) => {
-                            self.playlist_context(playlist_id).await?
+                            // Stores into the context cache itself as tracks arrive.
+                            return self.load_playlist_context(state, playlist_id).await;
                         }
                         ContextId::Album(album_id) => self.album_context(album_id).await?,
                         ContextId::Artist(artist_id) => self.artist_context(artist_id).await?,
@@ -748,6 +806,27 @@ impl AppClient {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Wait until Spotify reports `device_id` as the active device, then reset the buffered
+    /// playback from that state.
+    ///
+    /// Spotify takes a moment to reflect a transfer; until it does, refreshing would keep
+    /// pointing commands at the previous device.
+    async fn wait_for_active_device(&self, state: &SharedState, device_id: &str) -> Result<()> {
+        const MAX_ATTEMPTS: usize = 10;
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+        for _ in 0..MAX_ATTEMPTS {
+            let playback = self.current_playback2().await?;
+            if playback.is_some_and(|p| p.device.id.as_deref() == Some(device_id)) {
+                return self.retrieve_current_playback(state, true).await;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+
+        tracing::warn!(%device_id, "Spotify did not report the transferred device as active");
+        Ok(())
     }
 
     /// Get user available devices
@@ -1456,31 +1535,156 @@ impl AppClient {
 
     /// Get a playlist context data
     pub async fn playlist_context(&self, playlist_id: PlaylistId<'_>) -> Result<Context> {
-        let playlist_uri = playlist_id.uri();
-        tracing::info!("Get playlist context: {}", playlist_uri);
-
-        let playlist = self
-            .playlist(
-                playlist_id.clone(),
-                None,
-                Some(rspotify::model::Market::FromToken),
-            )
-            .await?;
-
+        let playlist = self.full_playlist(playlist_id.as_ref()).await?;
+        let first_page = playlist.items.clone();
         let tracks = self
-            .all_paging_items(
-                &format!("playlists/{}/items", playlist_id.id()),
-                playlist.items.total as usize,
-            )
-            .await?
-            .into_iter()
-            .filter_map(Track::try_from_playlist_item)
-            .collect::<Vec<_>>();
+            .playlist_tracks(playlist_id, first_page, |_| {})
+            .await?;
 
         Ok(Context::Playlist {
             playlist: playlist.into(),
             tracks,
         })
+    }
+
+    /// Load a playlist context into the state's context cache.
+    ///
+    /// A copy in the file cache is shown immediately and kept if the playlist's `snapshot_id`
+    /// is unchanged. Otherwise, tracks are fetched and, when nothing was cached, shown as
+    /// each page arrives.
+    async fn load_playlist_context(
+        &self,
+        state: &SharedState,
+        playlist_id: PlaylistId<'static>,
+    ) -> Result<()> {
+        let uri = playlist_id.uri();
+        let cache_folder = &config::get_config().cache_folder;
+
+        let cached = load_playlist_from_file_cache(cache_folder, &playlist_id);
+        if let Some(cached) = &cached {
+            state.data.write().caches.context.insert(
+                uri.clone(),
+                Context::Playlist {
+                    playlist: cached.playlist.clone(),
+                    tracks: cached.tracks.clone(),
+                },
+                *TTL_CACHE_DURATION,
+            );
+        }
+
+        let full_playlist = self.full_playlist(playlist_id.as_ref()).await?;
+        let first_page = full_playlist.items.clone();
+        let playlist: Playlist = full_playlist.into();
+
+        if cached
+            .as_ref()
+            .is_some_and(|c| c.playlist.snapshot_id == playlist.snapshot_id)
+        {
+            tracing::info!("Playlist {uri} is unchanged since it was cached");
+            return Ok(());
+        }
+
+        let progressive = cached.is_none();
+        let context_id = ContextId::Playlist(playlist_id.clone());
+        let result = self
+            .playlist_tracks(playlist_id, first_page, |page| {
+                if !progressive {
+                    return;
+                }
+                let mut data = state.data.write();
+                match data.context_tracks_mut(&context_id) {
+                    Some(tracks) => tracks.extend_from_slice(page),
+                    None => {
+                        data.caches.context.insert(
+                            uri.clone(),
+                            Context::Playlist {
+                                playlist: playlist.clone(),
+                                tracks: page.to_vec(),
+                            },
+                            *TTL_CACHE_DURATION,
+                        );
+                    }
+                }
+            })
+            .await;
+
+        let tracks = match result {
+            Ok(tracks) => tracks,
+            Err(err) => {
+                // Drop the partial list so the playlist is fetched again on the next visit.
+                if progressive {
+                    state.data.write().caches.context.remove(&uri);
+                }
+                return Err(err);
+            }
+        };
+
+        let cached = CachedPlaylist { playlist, tracks };
+        if let Err(err) = store_playlist_into_file_cache(cache_folder, &cached) {
+            tracing::warn!("Failed to store playlist {uri} into the cache folder: {err:#}");
+        }
+        state.data.write().caches.context.insert(
+            uri,
+            Context::Playlist {
+                playlist: cached.playlist,
+                tracks: cached.tracks,
+            },
+            *TTL_CACHE_DURATION,
+        );
+
+        Ok(())
+    }
+
+    /// Get a playlist's metadata along with its first page of items
+    async fn full_playlist(
+        &self,
+        playlist_id: PlaylistId<'_>,
+    ) -> Result<rspotify::model::FullPlaylist> {
+        tracing::info!("Get playlist: {}", playlist_id.uri());
+        Ok(self
+            .playlist(playlist_id, None, Some(rspotify::model::Market::FromToken))
+            .await?)
+    }
+
+    /// Get all tracks of a playlist, continuing after `first_page` (the items included in the
+    /// playlist response). `on_page` receives each page's tracks in order as they arrive.
+    async fn playlist_tracks(
+        &self,
+        playlist_id: PlaylistId<'_>,
+        first_page: rspotify::model::Page<rspotify::model::PlaylistItem>,
+        mut on_page: impl FnMut(&[Track]),
+    ) -> Result<Vec<Track>> {
+        // the maximum page size of the playlist items endpoint
+        const PAGE_LIMIT: usize = 100;
+        const MAX_PARALLEL: usize = 4;
+
+        let total = first_page.total as usize;
+        let start = first_page.items.len();
+        let mut tracks = first_page
+            .items
+            .into_iter()
+            .filter_map(Track::try_from_playlist_item)
+            .collect::<Vec<_>>();
+        on_page(&tracks);
+
+        let base_url = format!("playlists/{}/items", playlist_id.id());
+        let mut pages = futures::stream::iter((start..total).step_by(PAGE_LIMIT))
+            .map(|offset| {
+                self.paging_page::<rspotify::model::PlaylistItem>(&base_url, offset, PAGE_LIMIT)
+            })
+            .buffered(MAX_PARALLEL);
+
+        while let Some(page) = pages.next().await {
+            let page = page?
+                .items
+                .into_iter()
+                .filter_map(Track::try_from_playlist_item)
+                .collect::<Vec<_>>();
+            on_page(&page);
+            tracks.extend(page);
+        }
+
+        Ok(tracks)
     }
 
     /// Get an album context data
@@ -1594,6 +1798,48 @@ impl AppClient {
         Ok(serde_json::from_str(&text)?)
     }
 
+    /// Get one page of a paging endpoint, retrying with a backoff on failure so a single
+    /// failed page doesn't throw away the pages already fetched.
+    async fn paging_page<T>(
+        &self,
+        base_url: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<rspotify::model::Page<T>>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        const MAX_ATTEMPTS: u32 = 3;
+
+        let limit = limit.to_string();
+        let offset_str = offset.to_string();
+        let params = Query::from([
+            ("market", "from_token"),
+            ("limit", limit.as_str()),
+            ("offset", offset_str.as_str()),
+        ]);
+
+        let mut attempt = 1;
+        loop {
+            match self.http_get(base_url, &params).await {
+                Ok(page) => return Ok(page),
+                Err(err) if attempt < MAX_ATTEMPTS => {
+                    let backoff = std::time::Duration::from_secs(2_u64.pow(attempt));
+                    tracing::warn!(
+                        base_url,
+                        offset,
+                        attempt,
+                        "Failed to fetch page, retrying in {}s: {err:#}",
+                        backoff.as_secs()
+                    );
+                    tokio::time::sleep(backoff).await;
+                    attempt += 1;
+                }
+                Err(err) => return Err(err.context(format!("fetch {base_url} at offset {offset}"))),
+            }
+        }
+    }
+
     async fn all_paging_items<T>(&self, base_url: &str, mut count: usize) -> Result<Vec<T>>
     where
         T: serde::de::DeserializeOwned + std::fmt::Debug,
@@ -1617,18 +1863,8 @@ impl AppClient {
 
             for i in 0..n_jobs {
                 let current_offset = offset + i * PAGE_LIMIT;
-                let limit_str = PAGE_LIMIT.to_string();
-                let offset_str = current_offset.to_string();
 
-                futures.push(async move {
-                    let params = Query::from([
-                        ("market", "from_token"),
-                        ("limit", &limit_str),
-                        ("offset", &offset_str),
-                    ]);
-                    self.http_get::<rspotify::model::Page<T>>(base_url, &params)
-                        .await
-                });
+                futures.push(self.paging_page::<T>(base_url, current_offset, PAGE_LIMIT));
             }
 
             let results = futures::future::try_join_all(futures).await?;
@@ -2038,6 +2274,21 @@ impl AppClient {
     }
 }
 
+/// Whether a player request failed because it targeted a device Spotify no longer knows about.
+fn is_device_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rspotify::ClientError>(),
+            Some(rspotify::ClientError::Http(http_err))
+                if matches!(
+                    http_err.as_ref(),
+                    rspotify::http::HttpError::StatusCode(response)
+                        if response.status() == reqwest::StatusCode::NOT_FOUND
+                )
+        )
+    })
+}
+
 fn move_seed_track_to_front(tracks: &mut Vec<Track>, seed_track: Track) {
     tracks.retain(|track| track.id != seed_track.id);
     tracks.insert(0, seed_track);
@@ -2045,9 +2296,24 @@ fn move_seed_track_to_front(tracks: &mut Vec<Track>, seed_track: Track) {
 
 #[cfg(test)]
 mod tests {
-    use super::{move_seed_track_to_front, parse_current_playback_response};
+    use super::{is_device_not_found, move_seed_track_to_front, parse_current_playback_response};
     use crate::state::Track;
     use rspotify::model::{PlayableItem, TrackId};
+
+    fn http_error(status: u16) -> anyhow::Error {
+        let response = http::Response::builder().status(status).body("").unwrap();
+        let err = rspotify::ClientError::Http(Box::new(rspotify::http::HttpError::StatusCode(
+            reqwest::Response::from(response),
+        )));
+        anyhow::Error::from(err).context("send player request")
+    }
+
+    #[test]
+    fn detects_device_not_found_errors() {
+        assert!(is_device_not_found(&http_error(404)));
+        assert!(!is_device_not_found(&http_error(429)));
+        assert!(!is_device_not_found(&anyhow::anyhow!("no playback found")));
+    }
 
     fn sample_track(id: &'static str, name: &str) -> Track {
         Track {
