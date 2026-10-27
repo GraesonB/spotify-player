@@ -1,12 +1,12 @@
 use std::io::{BufReader, BufWriter};
 use std::{collections::HashMap, path::Path};
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::sync::LazyLock;
 
 use super::model::{
     Album, Artist, Category, Context, ContextId, Id, Playlist, PlaylistFolderItem,
-    PlaylistFolderNode, SearchResults, Show, Track,
+    PlaylistFolderNode, PlaylistId, SearchResults, Show, Track,
 };
 use super::Lyrics;
 
@@ -252,43 +252,116 @@ impl UserData {
     }
 }
 
+/// A playlist with all of its tracks, persisted per playlist so unchanged playlists
+/// (same `snapshot_id`) don't need to be refetched.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct CachedPlaylist {
+    pub playlist: Playlist,
+    pub tracks: Vec<Track>,
+}
+
+fn playlist_cache_path(cache_folder: &Path, id: &PlaylistId) -> std::path::PathBuf {
+    cache_folder
+        .join("playlists")
+        .join(format!("{}.json", id.id()))
+}
+
 pub fn store_data_into_file_cache<T: Serialize>(
     key: FileCacheKey,
     cache_folder: &Path,
     data: &T,
 ) -> std::io::Result<()> {
-    let path = cache_folder.join(format!("{key:?}_cache.json"));
-    let f = BufWriter::new(std::fs::File::create(path)?);
-    serde_json::to_writer(f, data)?;
-    Ok(())
+    store_json(&cache_folder.join(format!("{key:?}_cache.json")), data)
 }
 
 pub fn load_data_from_file_cache<T>(key: FileCacheKey, cache_folder: &Path) -> Option<T>
 where
     T: DeserializeOwned,
 {
-    let path = cache_folder.join(format!("{key:?}_cache.json"));
-    if path.exists() {
-        tracing::info!("Loading {key:?} data from {}...", path.display());
-        let f = BufReader::new(std::fs::File::open(path).expect("path exists"));
-        match serde_json::from_reader(f) {
-            Ok(data) => {
-                tracing::info!("Successfully loaded {key:?} data!");
-                Some(data)
-            }
-            Err(err) => {
-                tracing::error!("Failed to load {key:?} data: {err:#}");
-                None
-            }
+    load_json(&cache_folder.join(format!("{key:?}_cache.json")))
+}
+
+pub fn store_playlist_into_file_cache(
+    cache_folder: &Path,
+    playlist: &CachedPlaylist,
+) -> std::io::Result<()> {
+    let path = playlist_cache_path(cache_folder, &playlist.playlist.id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    store_json(&path, playlist)
+}
+
+pub fn load_playlist_from_file_cache(
+    cache_folder: &Path,
+    id: &PlaylistId,
+) -> Option<CachedPlaylist> {
+    load_json(&playlist_cache_path(cache_folder, id))
+}
+
+fn store_json<T: Serialize>(path: &Path, data: &T) -> std::io::Result<()> {
+    let f = BufWriter::new(std::fs::File::create(path)?);
+    serde_json::to_writer(f, data)?;
+    Ok(())
+}
+
+fn load_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    if !path.exists() {
+        return None;
+    }
+    tracing::info!("Loading data from {}...", path.display());
+    let f = BufReader::new(std::fs::File::open(path).ok()?);
+    match serde_json::from_reader(f) {
+        Ok(data) => {
+            tracing::info!("Successfully loaded data from {}", path.display());
+            Some(data)
         }
-    } else {
-        None
+        Err(err) => {
+            tracing::error!("Failed to load data from {}: {err:#}", path.display());
+            None
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MemoryCaches, SearchCacheEntry, SearchResults};
+    use super::{
+        load_playlist_from_file_cache, store_playlist_into_file_cache, CachedPlaylist,
+        MemoryCaches, SearchCacheEntry, SearchResults,
+    };
+    use crate::state::{Playlist, PlaylistId, UserId};
+
+    #[test]
+    fn playlist_file_cache_round_trip() {
+        let cache_folder = std::env::temp_dir().join(format!(
+            "spotify-player-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let id = PlaylistId::from_id("37i9dQZF1DXcBWIGoYBM5M").unwrap();
+        let playlist = CachedPlaylist {
+            playlist: Playlist {
+                id: id.clone().into_static(),
+                collaborative: false,
+                name: "name".to_string(),
+                owner: (
+                    "owner".to_string(),
+                    UserId::from_id("owner").unwrap().into_static(),
+                ),
+                desc: String::new(),
+                current_folder_id: 0,
+                snapshot_id: "snapshot".to_string(),
+            },
+            tracks: vec![],
+        };
+
+        assert!(load_playlist_from_file_cache(&cache_folder, &id).is_none());
+        store_playlist_into_file_cache(&cache_folder, &playlist).unwrap();
+        let loaded = load_playlist_from_file_cache(&cache_folder, &id).unwrap();
+        assert_eq!(loaded.playlist.snapshot_id, "snapshot");
+
+        std::fs::remove_dir_all(cache_folder).unwrap();
+    }
 
     #[test]
     fn search_lifecycle_suppresses_duplicate_requests() {
