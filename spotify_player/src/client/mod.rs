@@ -1725,7 +1725,7 @@ impl AppClient {
         let artist_uri = artist_id.uri();
         tracing::info!("Get artist context: {}", artist_uri);
 
-        // get the artist's information, including top tracks, related artists, and albums
+        // get the artist's information, including top tracks and albums
 
         let artist = self
             .artist(artist_id.as_ref())
@@ -1742,16 +1742,6 @@ impl AppClient {
             .filter_map(Track::try_from_full_track)
             .collect::<Vec<_>>();
 
-        #[allow(deprecated)]
-        let related_artists = self
-            .artist_related_artists(artist_id.as_ref())
-            .await
-            .ok()
-            .unwrap_or_default()
-            .into_iter()
-            .map(std::convert::Into::into)
-            .collect::<Vec<_>>();
-
         let albums = self
             .artist_albums(artist_id.as_ref())
             .await
@@ -1761,7 +1751,6 @@ impl AppClient {
             artist,
             top_tracks,
             albums,
-            related_artists,
         })
     }
 

@@ -33,7 +33,6 @@ pub enum Context {
         artist: Artist,
         top_tracks: Vec<Track>,
         albums: Vec<Album>,
-        related_artists: Vec<Artist>,
     },
     Tracks {
         tracks: Vec<Track>,

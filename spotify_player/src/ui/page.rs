@@ -379,7 +379,6 @@ pub fn render_context_page(
                     artist,
                     top_tracks,
                     albums,
-                    related_artists,
                 } => {
                     render_artist_context_page_windows(
                         is_active,
@@ -388,7 +387,7 @@ pub fn render_context_page(
                         ui,
                         &data,
                         rect,
-                        (artist, top_tracks, albums, related_artists),
+                        (artist, top_tracks, albums),
                     );
                 }
                 Context::Playlist { tracks, playlist } => {
@@ -903,7 +902,6 @@ pub fn render_queue_page(
 /// - A top track table
 /// - A liked songs table (tracks liked by the user from this artist)
 /// - An album table
-/// - A related artist list
 fn render_artist_context_page_windows(
     is_active: bool,
     frame: &mut Frame,
@@ -911,14 +909,13 @@ fn render_artist_context_page_windows(
     ui: &mut UIStateGuard,
     data: &DataReadGuard,
     rect: Rect,
-    artist_data: (&Artist, &[Track], &[Album], &[Artist]),
+    artist_data: (&Artist, &[Track], &[Album]),
 ) {
     // 1. Get data
-    let (artist, tracks, albums, artists) = (
+    let (artist, tracks, albums) = (
         artist_data.0,
         ui.search_filtered_items(artist_data.1),
         ui.search_filtered_items(artist_data.2),
-        ui.search_filtered_items(artist_data.3),
     );
 
     // Collect liked tracks for this artist, sorted newest first
@@ -936,7 +933,7 @@ fn render_artist_context_page_windows(
     // 2. Construct the page's layout: 3-row stack
     // row 1: top tracks (full width)
     // row 2: liked songs (full width)
-    // row 3: albums (left half) | related artists (right half)
+    // row 3: albums (full width)
     let rows = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Fill(1),
@@ -947,21 +944,7 @@ fn render_artist_context_page_windows(
     let liked_songs_rect =
         construct_and_render_block("Liked Songs", &ui.theme, Borders::TOP, frame, rows[1]);
 
-    let bot_chunks = Layout::horizontal([Constraint::Ratio(1, 2); 2]).split(rows[2]);
-    let albums_rect = construct_and_render_block(
-        "Albums",
-        &ui.theme,
-        Borders::TOP | Borders::RIGHT,
-        frame,
-        bot_chunks[0],
-    );
-    let related_artists_rect = construct_and_render_block(
-        "Related Artists",
-        &ui.theme,
-        Borders::TOP,
-        frame,
-        bot_chunks[1],
-    );
+    let albums_rect = construct_and_render_block("Albums", &ui.theme, Borders::TOP, frame, rows[2]);
 
     // 3. Construct the page's widgets
     // album table
@@ -998,23 +981,6 @@ fn render_artist_context_page_windows(
     .column_spacing(2)
     .row_highlight_style(ui.theme.selection(is_albums_active));
 
-    // artist list widget
-    let (artist_list, n_artists) = {
-        let artist_items = artists
-            .into_iter()
-            .map(|a| (a.name.clone(), false))
-            .collect::<Vec<_>>();
-
-        let is_artist_active = is_active && focus_state == ArtistFocusState::RelatedArtists;
-        let selected_index = if is_artist_active {
-            ui.current_page_mut().selected()
-        } else {
-            None
-        };
-
-        utils::construct_list_widget(&ui.theme, artist_items, is_artist_active, selected_index)
-    };
-
     // 4. Render the page's widgets
     render_track_table(
         frame,
@@ -1039,12 +1005,7 @@ fn render_artist_context_page_windows(
     );
 
     let PageState::Context {
-        state:
-            Some(ContextPageUIState::Artist {
-                album_table,
-                related_artist_list,
-                ..
-            }),
+        state: Some(ContextPageUIState::Artist { album_table, .. }),
         ..
     } = ui.current_page_mut()
     else {
@@ -1052,13 +1013,6 @@ fn render_artist_context_page_windows(
     };
 
     utils::render_table_window(frame, albums_table, albums_rect, n_albums, album_table);
-    utils::render_list_window(
-        frame,
-        artist_list,
-        related_artists_rect,
-        n_artists,
-        related_artist_list,
-    );
 }
 
 #[allow(clippy::too_many_arguments)]

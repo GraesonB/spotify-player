@@ -26,7 +26,6 @@ pub fn handle_action_for_focused_context_page(
             artist,
             top_tracks,
             albums,
-            related_artists,
         }) => {
             let PageState::Context {
                 state: Some(ContextPageUIState::Artist { focus, .. }),
@@ -40,13 +39,6 @@ pub fn handle_action_for_focused_context_page(
                 ArtistFocusState::Albums => handle_action_for_selected_item(
                     action,
                     &ui.search_filtered_items(albums),
-                    &data,
-                    ui,
-                    client_pub,
-                ),
-                ArtistFocusState::RelatedArtists => handle_action_for_selected_item(
-                    action,
-                    &ui.search_filtered_items(related_artists),
                     &data,
                     ui,
                     client_pub,
@@ -157,7 +149,6 @@ pub fn handle_command_for_focused_context_window(
                 artist,
                 top_tracks,
                 albums,
-                related_artists,
             } => {
                 let PageState::Context {
                     state: Some(ContextPageUIState::Artist { focus, .. }),
@@ -175,12 +166,6 @@ pub fn handle_command_for_focused_context_window(
                         ui,
                         client_pub,
                     ),
-                    ArtistFocusState::RelatedArtists => Ok(handle_command_for_artist_list_window(
-                        command,
-                        &ui.search_filtered_items(related_artists),
-                        &data,
-                        ui,
-                    )),
                     ArtistFocusState::TopTracks => handle_command_for_track_table_window(
                         command, client_pub, None, top_tracks, &data, ui, state,
                     ),
